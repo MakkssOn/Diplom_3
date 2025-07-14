@@ -1,97 +1,81 @@
 import pytest
-import os
-import sys
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.webdriver.firefox.service import Service as FirefoxService
-from webdriver_manager.chrome import ChromeDriverManager
-from webdriver_manager.firefox import GeckoDriverManager
-from typing import Generator, Union
-from selenium.webdriver.remote.webdriver import WebDriver
+from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.firefox.firefox_profile import FirefoxProfile
+from helpers import *
+import requests
+from urls import Urls
+import allure
 
 
-# Добавляем корневую директорию проекта в PYTHONPATH
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-
-class WebDriverFactory:
-    """Фабрика для создания экземпляров WebDriver с поддержкой разных браузеров."""
-    
-    @staticmethod
-    def get_webdriver(browser_name: str) -> WebDriver:
-        """
-        Создает и возвращает экземпляр WebDriver для указанного браузера.
-        
-        Args:
-            browser_name: Имя браузера ('chrome' или 'firefox')
-            
-        Returns:
-            Экземпляр WebDriver
-            
-        Raises:
-            ValueError: Если передан неподдерживаемый браузер
-            WebDriverException: Если возникла проблема при инициализации драйвера
-        """
-        browser_name = browser_name.lower()
-        
-        try:
-            if browser_name == 'firefox':
-                service = FirefoxService(GeckoDriverManager().install())
-                driver = webdriver.Firefox(service=service)
-            elif browser_name == 'chrome':
-                service = ChromeService(ChromeDriverManager().install())
-                driver = webdriver.Chrome(service=service)
-            else:
-                raise ValueError(f"Browser '{browser_name}' is not supported. Use 'chrome' or 'firefox'")
-            
-            return driver
-        except Exception as e:
-            raise RuntimeError(f"Failed to initialize {browser_name} driver: {str(e)}")
-
-
-@pytest.fixture(scope="function")
-def browser(request: pytest.FixtureRequest) -> Generator[WebDriver, None, None]:
-    """
-    Фикстура для инициализации и завершения работы WebDriver.
-    
-    Поддерживает параметризацию через pytest.mark.parametrize или --browser.
-    По умолчанию использует chrome.
-    """
-    # Получаем имя браузера из параметра теста или из командной строки
-    browser_name = getattr(request, "param", None) or request.config.getoption("--browser")
-    
-    driver = WebDriverFactory.get_webdriver(browser_name)
-    driver.maximize_window()
-    driver.implicitly_wait(10)  # Устанавливаем неявное ожидание
-    
+@pytest.fixture(params=[webdriver.Firefox, webdriver.Chrome], ids=['firefox', 'chrome'], scope="function")
+def driver(request):
+    driver_class = request.param
+    if driver_class == webdriver.Chrome:
+        options = Options()
+        options.add_argument('--window-size=1920,1080')
+        options.add_argument('--incognito')
+        driver = webdriver.Chrome(options=options)
+    elif driver_class == webdriver.Firefox:
+        firefox_options = webdriver.FirefoxOptions()
+        firefox_options.add_argument('--width=1920')
+        firefox_options.add_argument('--height=1080')
+        profile = FirefoxProfile()
+        profile.set_preference("browser.privatebrowsing.autostart", True)
+        firefox_options.profile = profile
+        driver = webdriver.Firefox(options=firefox_options)
+    driver.get(Urls.base_url)
     yield driver
-    
-    # Завершение работы драйвера
-    try:
-        driver.quit()
-    except Exception as e:
-        print(f"Warning: Failed to properly quit driver: {str(e)}")
+    driver.quit()
 
 
-def pytest_addoption(parser: pytest.Parser) -> None:
-    """Добавляем кастомные параметры командной строки для pytest."""
-    parser.addoption(
-        "--browser",
-        action="store",
-        default="chrome",
-        help="Browser to use for tests (chrome or firefox)",
-        choices=["chrome", "firefox"]
-    )
-    parser.addoption(
-        "--headless",
-        action="store_true",
-        default=False,
-        help="Run tests in headless mode"
-    )
+@pytest.fixture
+def generate_user_credentials():
+    email = create_random_email()
+    password = create_random_password()
+    name = create_random_name()
+    return email, password, name
 
 
-@pytest.fixture(scope="session", autouse=True)
-def setup_environment() -> None:
-    """Общая настройка окружения перед запуском тестов."""
-    # Здесь можно добавить общие настройки
-    pass
+@pytest.fixture
+@allure.title('Фикстура создает пользователя с рандомными кредами и удаляет его из базы после теста')
+def create_new_user_and_delete():
+    payload_cred = {
+        'email': create_random_email(),
+        'password': create_random_password(),
+        'name': create_random_name()
+    }
+    response = requests.post(Urls.user_register, data=payload_cred)
+    response_body = response.json()
+
+    yield payload_cred, response_body
+
+    access_token = response_body['accessToken']
+    requests.delete(Urls.user_delete, headers={'Authorization': access_token})
+
+
+@pytest.fixture
+@allure.title('Фикстура создает пользователя и заказ для его аккаунта')
+def create_user_and_order_and_delete(create_new_user_and_delete):
+    access_token = create_new_user_and_delete[1]['accessToken']
+    headers = {'Authorization': access_token}
+    payload = {'ingredients': [
+        '61c0c5a71d1f82001bdaaa73', '61c0c5a71d1f82001bdaaa6c',
+        '61c0c5a71d1f82001bdaaa76', '61c0c5a71d1f82001bdaaa79'
+    ]}
+    response_body = requests.post(Urls.order_create, data=payload, headers=headers)
+
+    yield access_token, response_body
+    requests.delete(Urls.user_delete, headers={'Authorization': access_token})
+
+
+@pytest.fixture
+@allure.title('Фикстура передает в драйвер токены созданного пользователя')
+def set_user_tokens(driver, create_new_user_and_delete):
+    driver.get(Urls.base_url)
+    user_data = create_new_user_and_delete[1]
+    access_token = user_data.get('accessToken')
+    refresh_token = user_data.get('refreshToken')
+    driver.execute_script(f'window.localStorage.setItem("accessToken", "{access_token}");')
+    driver.execute_script(f'window.localStorage.setItem("refreshToken", "{refresh_token}");')
